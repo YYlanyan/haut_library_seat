@@ -1,0 +1,25 @@
+{
+  "defaults": {
+    "seats": [1399, 623],
+    "end_time": "22:00:00",
+    "rush_seconds": 5,
+    "channel": 1001,
+    "leave_channel_type": 1003
+  },
+  "accounts": [
+    {
+      "name": "account_1",
+      "username": "replace-with-username",
+      "password": "replace-with-password",
+      "enabled": true,
+      "seats": [1399, 623]
+    },
+    {
+      "name": "account_2",
+      "username": "replace-with-username",
+      "password": "replace-with-password",
+      "enabled": true,
+      "seats": [1399, 623]
+    }
+  ]
+}
