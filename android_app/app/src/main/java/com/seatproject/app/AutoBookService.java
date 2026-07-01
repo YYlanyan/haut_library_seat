@@ -27,13 +27,14 @@ public final class AutoBookService extends Service {
                         this,
                         "book",
                         accountName,
-                        true,
+                        AutoBookScheduler.bookTime(this),
                         message -> {
                         }
                 );
                 updateNotification(failures == 0 ? "自动预约完成" : "自动预约完成，有账号失败");
             } finally {
                 AutoBookScheduler.scheduleNext(this);
+                AutoBookScheduler.startStatusService(this);
                 stopForeground(false);
                 stopSelf(startId);
             }

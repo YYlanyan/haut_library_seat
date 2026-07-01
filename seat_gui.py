@@ -75,14 +75,16 @@ class SeatWorker(QObject):
         config_path: Path,
         account_name: Optional[str],
         interval: float,
-        allow_wait: bool,
+        booking_send_mode: str,
+        booking_send_time: str,
     ) -> None:
         super().__init__()
         self.command = command
         self.config_path = config_path
         self.account_name = account_name
         self.interval = interval
-        self.allow_wait = allow_wait
+        self.booking_send_mode = booking_send_mode
+        self.booking_send_time = booking_send_time
 
     def run(self) -> None:
         previous_log = seat_tool.log
@@ -91,13 +93,8 @@ class SeatWorker(QObject):
             config = seat_tool.load_config(self.config_path)
             accounts = seat_tool.build_accounts(config, self.account_name)
 
-            if self.command == "book" and seat_tool.should_wait_for_login():
-                if not self.allow_wait:
-                    self.log.emit("当前不在可预约时间。已取消预约；可勾选“允许等待到 06:59:30”。")
-                    self.done.emit(False, "当前不在可预约时间")
-                    return
-                seat_tool.log("当前不在可预约时间，等待到 06:59:30 登录...")
-                seat_tool.wait_until_login_window()
+            if self.command == "book" and self.booking_send_mode == "time":
+                seat_tool.wait_until_clock_time(self.booking_send_time)
 
             failures = 0
             for account in accounts:
@@ -136,12 +133,65 @@ class SeatWorker(QObject):
             seat_tool.log = previous_log
 
 
+class SeatCrawlWorker(QObject):
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool, str, object)
+
+    def __init__(self, config_path: Path, account_name: Optional[str]) -> None:
+        super().__init__()
+        self.config_path = config_path
+        self.account_name = account_name
+
+    def run(self) -> None:
+        previous_log = seat_tool.log
+        seat_tool.log = LogProxy(self.log)
+        try:
+            config = seat_tool.load_config(self.config_path)
+            accounts = seat_tool.build_accounts(config, self.account_name)
+            account = accounts[0]
+            token = seat_tool.login(account)
+            if not token:
+                self.done.emit(False, "登录失败，无法爬取座位", {})
+                return
+
+            regions = seat_tool.get_all_regions(token, account.name)
+            available_regions = []
+            seats_by_region = {}
+            total_seat_count = 0
+            available_seat_count = 0
+            for region in regions:
+                region_seats = seat_tool.get_seats_by_region_with_stats(token, region.region_id, account.name)
+                seats = region_seats.available_seats
+                total_seat_count += region_seats.total_seats
+                available_seat_count += len(seats)
+                if seats:
+                    available_regions.append(region)
+                    seats_by_region[region.region_id] = seats
+                self.log.emit(f"已爬取 {region.name}：{len(seats)} 个座位")
+
+            occupied_seat_count = max(0, total_seat_count - available_seat_count)
+            self.done.emit(True, f"爬取完成：{len(available_regions)} 个区域有可预约座位", {
+                "regions": available_regions,
+                "seats_by_region": seats_by_region,
+                "total_seat_count": total_seat_count,
+                "available_seat_count": available_seat_count,
+                "occupied_seat_count": occupied_seat_count,
+            })
+        except Exception as exc:
+            self.done.emit(False, str(exc), {})
+        finally:
+            seat_tool.log = previous_log
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.config_path = DEFAULT_CONFIG
         self.thread: Optional[QThread] = None
         self.worker: Optional[SeatWorker] = None
+        self.crawl_thread: Optional[QThread] = None
+        self.crawl_worker: Optional[SeatCrawlWorker] = None
+        self.seats_by_region = {}
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1120, 760)
@@ -203,10 +253,12 @@ class MainWindow(QMainWindow):
         self.account_count_label = QLabel("-")
         self.enabled_count_label = QLabel("-")
         self.default_seats_label = QLabel("-")
+        self.library_people_label = QLabel("约 -- 人")
         summary_layout.addRow("配置文件", self.config_label)
         summary_layout.addRow("账号数量", self.account_count_label)
         summary_layout.addRow("启用账号", self.enabled_count_label)
         summary_layout.addRow("默认座位", self.default_seats_label)
+        summary_layout.addRow("当前约人数", self.library_people_label)
         top_grid.addWidget(summary, 0, 0)
 
         run_box = QGroupBox("执行操作")
@@ -216,10 +268,14 @@ class MainWindow(QMainWindow):
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(0, 60)
         self.interval_spin.setSuffix(" 秒")
-        self.allow_wait_checkbox = QCheckBox("允许预约命令等待到 06:59:30")
+        self.booking_mode_combo = QComboBox()
+        self.booking_mode_combo.addItem("直接发送预约指令", "direct")
+        self.booking_mode_combo.addItem("指定时间发送预约指令", "time")
+        self.booking_time_input = QLineEdit("06:59:30")
         run_layout.addRow("目标账号", self.account_combo)
         run_layout.addRow("账号间隔", self.interval_spin)
-        run_layout.addRow("", self.allow_wait_checkbox)
+        run_layout.addRow("预约发送", self.booking_mode_combo)
+        run_layout.addRow("发送时间", self.booking_time_input)
         top_grid.addWidget(run_box, 0, 1)
         top_grid.setColumnStretch(0, 1)
         top_grid.setColumnStretch(1, 1)
@@ -292,7 +348,25 @@ class MainWindow(QMainWindow):
         self.accounts_table.verticalHeader().setVisible(False)
         root.addWidget(self.accounts_table, 1)
 
-        hint = QLabel("座位列表用英文逗号分隔，例如：1399, 623。配置保存后，控制台会自动刷新。")
+        picker = QGroupBox("从座位列表选择")
+        picker_layout = QGridLayout(picker)
+        self.region_combo = QComboBox()
+        self.seat_combo = QComboBox()
+        crawl_button = QPushButton("刷新座位列表")
+        add_seat_button = QPushButton("添加到选中账号")
+        crawl_button.clicked.connect(self.start_seat_crawl)
+        add_seat_button.clicked.connect(self.add_selected_seat_to_account)
+        self.region_combo.currentIndexChanged.connect(self.refresh_seat_combo)
+
+        picker_layout.addWidget(QLabel("区域"), 0, 0)
+        picker_layout.addWidget(self.region_combo, 0, 1)
+        picker_layout.addWidget(crawl_button, 0, 2)
+        picker_layout.addWidget(QLabel("座位"), 1, 0)
+        picker_layout.addWidget(self.seat_combo, 1, 1)
+        picker_layout.addWidget(add_seat_button, 1, 2)
+        root.addWidget(picker)
+
+        hint = QLabel("可通过“刷新座位列表”爬取座位，再从下拉框选择座位加入账号配置。")
         hint.setObjectName("hint")
         root.addWidget(hint)
 
@@ -546,9 +620,23 @@ class MainWindow(QMainWindow):
         account_name = self.account_combo.currentData() or None
         if not self.save_config():
             return
+        booking_send_mode = self.booking_mode_combo.currentData() or "direct"
+        booking_send_time = self.booking_time_input.text().strip()
+        if command == "book" and booking_send_mode == "time":
+            try:
+                seat_tool.parse_clock_time(booking_send_time)
+            except ValueError as exc:
+                QMessageBox.warning(self, "时间格式错误", str(exc))
+                return
+
         self.set_running(True)
         self.tabs.setCurrentWidget(self.log_tab)
-        self.append_log(f"开始执行：{command}")
+        if command == "book" and booking_send_mode == "time":
+            self.statusBar().showMessage("等待到达预约时间")
+            self.append_log("等待到达预约时间")
+            self.append_log(f"开始执行：{command}，将在 {booking_send_time} 发送预约指令")
+        else:
+            self.append_log(f"开始执行：{command}")
 
         self.thread = QThread()
         self.worker = SeatWorker(
@@ -556,7 +644,8 @@ class MainWindow(QMainWindow):
             config_path=self.config_path,
             account_name=account_name,
             interval=float(self.interval_spin.value()),
-            allow_wait=self.allow_wait_checkbox.isChecked(),
+            booking_send_mode=booking_send_mode,
+            booking_send_time=booking_send_time,
         )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -567,6 +656,97 @@ class MainWindow(QMainWindow):
         self.thread.finished.connect(self.cleanup_worker)
         self.thread.finished.connect(self.thread.deleteLater)
         self.thread.start()
+
+    def start_seat_crawl(self) -> None:
+        if self.crawl_thread and self.crawl_thread.isRunning():
+            QMessageBox.information(self, "正在运行", "当前已有座位爬取任务在运行。")
+            return
+
+        account_name = self.account_combo.currentData() or None
+        if not self.save_config():
+            return
+
+        self.tabs.setCurrentWidget(self.log_tab)
+        self.append_log("开始爬取座位列表")
+        self.crawl_thread = QThread()
+        self.crawl_worker = SeatCrawlWorker(self.config_path, account_name)
+        self.crawl_worker.moveToThread(self.crawl_thread)
+        self.crawl_thread.started.connect(self.crawl_worker.run)
+        self.crawl_worker.log.connect(self.append_log)
+        self.crawl_worker.done.connect(self.finish_seat_crawl)
+        self.crawl_worker.done.connect(self.crawl_thread.quit)
+        self.crawl_worker.done.connect(self.crawl_worker.deleteLater)
+        self.crawl_thread.finished.connect(self.cleanup_crawl_worker)
+        self.crawl_thread.finished.connect(self.crawl_thread.deleteLater)
+        self.crawl_thread.start()
+
+    def finish_seat_crawl(self, success: bool, message: str, payload: object) -> None:
+        self.append_log(message)
+        self.statusBar().showMessage(message, 5000)
+        if not success:
+            QMessageBox.warning(self, "爬取失败", message)
+            return
+
+        data = payload if isinstance(payload, dict) else {}
+        regions = data.get("regions", [])
+        self.seats_by_region = data.get("seats_by_region", {})
+        total_seat_count = int(data.get("total_seat_count", 0) or 0)
+        available_seat_count = int(data.get("available_seat_count", 0) or 0)
+        occupied_seat_count = int(data.get("occupied_seat_count", 0) or 0)
+        self.region_combo.blockSignals(True)
+        self.region_combo.clear()
+        for region in regions:
+            self.region_combo.addItem(region.name, region)
+        self.region_combo.blockSignals(False)
+        self.refresh_seat_combo()
+        self.update_library_people(occupied_seat_count, total_seat_count, available_seat_count)
+        self.tabs.setCurrentWidget(self.config_tab)
+
+    def cleanup_crawl_worker(self) -> None:
+        self.crawl_thread = None
+        self.crawl_worker = None
+
+    def refresh_seat_combo(self, _index: int = -1) -> None:
+        self.seat_combo.clear()
+        region = self.region_combo.currentData()
+        if not region:
+            return
+
+        for seat in self.seats_by_region.get(region.region_id, []):
+            status_text = "可预约" if seat.is_can else "不可预约"
+            self.seat_combo.addItem(f"{seat.name} | {seat.seat_id} | {status_text}", seat)
+
+    def update_library_people(self, occupied_seat_count: int, total_seat_count: int, available_seat_count: int) -> None:
+        if total_seat_count <= 0:
+            self.library_people_label.setText("约 -- 人")
+            return
+
+        self.library_people_label.setText(f"约 {occupied_seat_count} 人")
+        self.append_log(
+            f"估算人数：总座位 {total_seat_count} - 可预约 {available_seat_count} = 约 {occupied_seat_count} 人"
+        )
+
+    def add_selected_seat_to_account(self) -> None:
+        seat = self.seat_combo.currentData()
+        if not seat:
+            QMessageBox.information(self, "未选择座位", "请先刷新并选择座位。")
+            return
+        if not seat.is_can:
+            QMessageBox.warning(self, "座位不可预约", "该座位当前不可预约，请选择标记为可预约的座位。")
+            return
+
+        selected_rows = sorted({item.row() for item in self.accounts_table.selectedItems()})
+        if not selected_rows:
+            QMessageBox.information(self, "未选择账号", "请先在账号表格中选中一个账号行。")
+            return
+
+        row = selected_rows[0]
+        seats_item = self.accounts_table.item(row, 4)
+        current_seats = self._parse_seats(self._item_text(seats_item))
+        if seat.seat_id not in current_seats:
+            current_seats.append(seat.seat_id)
+        self.accounts_table.setItem(row, 4, QTableWidgetItem(self._join_ints(current_seats)))
+        self.statusBar().showMessage(f"已添加座位 {seat.seat_id}", 3000)
 
     def finish_operation(self, success: bool, message: str) -> None:
         self.set_running(False)
@@ -584,6 +764,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: Any) -> None:
         if self.thread and self.thread.isRunning():
             QMessageBox.warning(self, "任务运行中", "当前还有任务在运行，请等待结束后再关闭窗口。")
+            event.ignore()
+            return
+        if self.crawl_thread and self.crawl_thread.isRunning():
+            QMessageBox.warning(self, "任务运行中", "当前还有座位爬取任务在运行，请等待结束后再关闭窗口。")
             event.ignore()
             return
 
@@ -606,6 +790,7 @@ class MainWindow(QMainWindow):
 
     def clear_logs(self) -> None:
         self.log_view.clear()
+        self.statusBar().showMessage("运行日志已清空", 3000)
 
     def _item_text(self, item: Optional[QTableWidgetItem]) -> str:
         return item.text().strip() if item else ""

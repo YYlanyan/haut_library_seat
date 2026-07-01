@@ -110,9 +110,10 @@ def main():
             for seat in seats:
                 seat_id = seat.get("id")
                 seat_name = seat.get("seatName")
+                is_can = int(seat.get("isCan", 0)) == 1
 
-                if seat_id and seat_name:
-                    f.write(f"{seat_id}\t{seat_name}\n")
+                if seat_id and seat_name and is_can:
+                    f.write(f"{seat_id}\t{seat_name}\t可预约\n")
 
     print("爬取完成，已保存到 seats.txt")
 

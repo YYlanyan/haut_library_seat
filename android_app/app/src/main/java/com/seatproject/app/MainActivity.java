@@ -1,7 +1,13 @@
 package com.seatproject.app;
 
+import android.Manifest;
 import android.app.Activity;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
@@ -21,12 +27,17 @@ import org.json.JSONArray;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
+    private static final String WAIT_NOTIFICATION_CHANNEL_ID = "seat_manual_wait";
+    private static final int WAIT_NOTIFICATION_ID = 65932;
+
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final List<Account> accounts = new ArrayList<>();
@@ -34,20 +45,29 @@ public final class MainActivity extends Activity {
 
     private SecureStore secureStore;
     private Spinner accountSpinner;
+    private Spinner bookingModeSpinner;
+    private Spinner bookingHourSpinner;
+    private Spinner bookingMinuteSpinner;
+    private Spinner bookingSecondSpinner;
     private EditText nameInput;
     private EditText usernameInput;
     private EditText passwordInput;
     private EditText seatsInput;
+    private Spinner regionSpinner;
+    private Spinner seatSpinner;
     private CheckBox enabledInput;
     private CheckBox autoBookInput;
     private TextView autoBookStatusView;
+    private TextView libraryPeopleView;
     private TextView logView;
+    private final Map<Integer, List<SeatOption>> seatsByRegion = new LinkedHashMap<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         secureStore = new SecureStore(this);
         setContentView(buildContentView());
+        requestNotificationPermissionIfNeeded();
         loadAccounts();
         refreshSpinner(null);
         loadAutoBookSettings();
@@ -66,19 +86,49 @@ public final class MainActivity extends Activity {
         root.setPadding(dp(16), dp(16), dp(16), dp(16));
         scrollView.addView(root);
 
+        LinearLayout titleRow = horizontalRow();
+        titleRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView title = new TextView(this);
         title.setText("图书馆座位助手");
         title.setTextSize(22);
         title.setGravity(Gravity.START);
         title.setPadding(0, 0, 0, dp(12));
-        root.addView(title);
+        title.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1));
+        libraryPeopleView = new TextView(this);
+        libraryPeopleView.setText("约 -- 人");
+        libraryPeopleView.setTextSize(14);
+        libraryPeopleView.setGravity(Gravity.END);
+        libraryPeopleView.setPadding(dp(8), 0, 0, dp(12));
+        titleRow.addView(title);
+        titleRow.addView(libraryPeopleView);
+        root.addView(titleRow);
 
         accountSpinner = new Spinner(this);
         root.addView(label("目标账号"));
         root.addView(accountSpinner);
 
+        bookingModeSpinner = new Spinner(this);
+        List<String> bookingModes = new ArrayList<>();
+        bookingModes.add("直接发送预约指令");
+        bookingModes.add("指定时间发送预约指令");
+        ArrayAdapter<String> bookingModeAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bookingModes);
+        bookingModeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        bookingModeSpinner.setAdapter(bookingModeAdapter);
+        bookingHourSpinner = numberSpinner(0, 23, "时");
+        bookingMinuteSpinner = numberSpinner(0, 59, "分");
+        bookingSecondSpinner = numberSpinner(0, 59, "秒");
+        setClockSpinners("06:59:30");
+        root.addView(label("手动预约发送方式"));
+        root.addView(bookingModeSpinner);
+        root.addView(label("预约发送时间"));
+        LinearLayout bookingTimeRow = horizontalRow();
+        bookingTimeRow.addView(bookingHourSpinner);
+        bookingTimeRow.addView(bookingMinuteSpinner);
+        bookingTimeRow.addView(bookingSecondSpinner);
+        root.addView(bookingTimeRow);
+
         autoBookInput = new CheckBox(this);
-        autoBookInput.setText("每天 06:59:30 自动预约当前选择目标");
+        autoBookInput.setText("每天按所选时分秒定时预约座位");
         root.addView(autoBookInput);
 
         Button saveAutoButton = plainButton("保存自动预约设置");
@@ -120,6 +170,22 @@ public final class MainActivity extends Activity {
         root.addView(passwordInput);
         root.addView(label("座位优先级"));
         root.addView(seatsInput);
+
+        root.addView(label("从座位列表选择"));
+        regionSpinner = new Spinner(this);
+        seatSpinner = new Spinner(this);
+        root.addView(regionSpinner);
+        root.addView(seatSpinner);
+
+        LinearLayout seatPickerRow = horizontalRow();
+        Button crawlSeatsButton = plainButton("刷新座位列表");
+        crawlSeatsButton.setOnClickListener(v -> crawlSeats());
+        Button addSelectedSeatButton = plainButton("添加所选座位");
+        addSelectedSeatButton.setOnClickListener(v -> addSelectedSeat());
+        seatPickerRow.addView(crawlSeatsButton);
+        seatPickerRow.addView(addSelectedSeatButton);
+        root.addView(seatPickerRow);
+
         root.addView(enabledInput);
 
         LinearLayout editRow = horizontalRow();
@@ -136,8 +202,18 @@ public final class MainActivity extends Activity {
         logView.setTextIsSelectable(true);
         logView.setPadding(0, dp(16), 0, 0);
         root.addView(label("运行日志"));
+        Button clearLogButton = plainButton("清空运行日志");
+        clearLogButton.setOnClickListener(v -> clearLogs());
+        root.addView(clearLogButton);
         root.addView(logView);
         return scrollView;
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 65931);
+        }
     }
 
     private Button actionButton(String text, String command) {
@@ -162,6 +238,53 @@ public final class MainActivity extends Activity {
         editText.setSingleLine(true);
         editText.setHint(hint);
         return editText;
+    }
+
+    private Spinner numberSpinner(int min, int max, String suffix) {
+        List<String> values = new ArrayList<>();
+        for (int value = min; value <= max; value++) {
+            values.add(String.format(Locale.CHINA, "%02d%s", value, suffix));
+        }
+        Spinner spinner = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, values);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        return spinner;
+    }
+
+    private String selectedClockTime() {
+        return String.format(
+                Locale.CHINA,
+                "%02d:%02d:%02d",
+                bookingHourSpinner.getSelectedItemPosition(),
+                bookingMinuteSpinner.getSelectedItemPosition(),
+                bookingSecondSpinner.getSelectedItemPosition()
+        );
+    }
+
+    private void setClockSpinners(String time) {
+        int[] parts = parseClockTimeParts(time);
+        bookingHourSpinner.setSelection(parts[0]);
+        bookingMinuteSpinner.setSelection(parts[1]);
+        bookingSecondSpinner.setSelection(parts[2]);
+    }
+
+    private int[] parseClockTimeParts(String time) {
+        String[] parts = time == null ? new String[0] : time.trim().split(":");
+        if (parts.length < 2 || parts.length > 3) {
+            return new int[]{6, 59, 30};
+        }
+        try {
+            int hour = Integer.parseInt(parts[0]);
+            int minute = Integer.parseInt(parts[1]);
+            int second = parts.length == 3 ? Integer.parseInt(parts[2]) : 0;
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+                return new int[]{6, 59, 30};
+            }
+            return new int[]{hour, minute, second};
+        } catch (NumberFormatException exception) {
+            return new int[]{6, 59, 30};
+        }
     }
 
     private TextView label(String text) {
@@ -221,6 +344,127 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void crawlSeats() {
+        String selectedName = selectedAccountName();
+        List<Account> targets = selectedName == null ? enabledAccounts() : namedAccount(selectedName);
+        if (targets.isEmpty()) {
+            toast("没有可用于爬取的账号");
+            return;
+        }
+
+        Account account = targets.get(0);
+        setRunning(true);
+        appendLog("开始爬取座位列表，账号：" + account.name);
+        executor.execute(() -> {
+            SeatApiClient client = new SeatApiClient(this::appendLogFromWorker);
+            try {
+                String token = client.login(account);
+                if (token.isEmpty()) {
+                    throw new IllegalStateException("登录失败");
+                }
+
+                List<SeatRegion> regions = client.seatRegions(token);
+                List<SeatRegion> availableRegions = new ArrayList<>();
+                Map<Integer, List<SeatOption>> result = new LinkedHashMap<>();
+                int totalSeatCount = 0;
+                int availableSeatCount = 0;
+                for (SeatRegion region : regions) {
+                    SeatRegionSeats regionSeats = client.seatsByRegionWithStats(token, region.id);
+                    List<SeatOption> seats = regionSeats.availableSeats;
+                    totalSeatCount += regionSeats.totalSeats;
+                    availableSeatCount += seats.size();
+                    if (!seats.isEmpty()) {
+                        availableRegions.add(region);
+                        result.put(region.id, seats);
+                    }
+                    appendLogFromWorker("已爬取 " + region.name + "：" + seats.size() + " 个座位");
+                }
+
+                int occupiedSeatCount = Math.max(0, totalSeatCount - availableSeatCount);
+                int finalTotalSeatCount = totalSeatCount;
+                int finalAvailableSeatCount = availableSeatCount;
+                mainHandler.post(() -> {
+                    seatsByRegion.clear();
+                    seatsByRegion.putAll(result);
+                    refreshRegionSpinner(availableRegions);
+                    updateLibraryPeople(occupiedSeatCount, finalTotalSeatCount, finalAvailableSeatCount);
+                    setRunning(false);
+                    appendLog("座位列表爬取完成：" + availableRegions.size() + " 个区域有可预约座位；约 "
+                            + occupiedSeatCount + " 人在馆");
+                    toast("座位列表爬取完成");
+                });
+            } catch (Exception exception) {
+                mainHandler.post(() -> {
+                    setRunning(false);
+                    appendLog("座位列表爬取失败：" + exception.getMessage());
+                    toast("座位列表爬取失败");
+                });
+            }
+        });
+    }
+
+    private void refreshRegionSpinner(List<SeatRegion> regions) {
+        ArrayAdapter<SeatRegion> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, regions);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        regionSpinner.setAdapter(adapter);
+        regionSpinner.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                SeatRegion region = (SeatRegion) regionSpinner.getSelectedItem();
+                refreshSeatSpinner(region == null ? new ArrayList<>() : seatsByRegion.get(region.id));
+            }
+
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {
+            }
+        });
+        if (!regions.isEmpty()) {
+            refreshSeatSpinner(seatsByRegion.get(regions.get(0).id));
+        } else {
+            refreshSeatSpinner(new ArrayList<>());
+        }
+    }
+
+    private void refreshSeatSpinner(List<SeatOption> seats) {
+        List<SeatOption> options = seats == null ? new ArrayList<>() : seats;
+        ArrayAdapter<SeatOption> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, options);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        seatSpinner.setAdapter(adapter);
+    }
+
+    private void updateLibraryPeople(int occupiedSeatCount, int totalSeatCount, int availableSeatCount) {
+        if (libraryPeopleView == null) {
+            return;
+        }
+        if (totalSeatCount <= 0) {
+            libraryPeopleView.setText("约 -- 人");
+            return;
+        }
+        libraryPeopleView.setText("约 " + occupiedSeatCount + " 人");
+        appendLog("估算人数：总座位 " + totalSeatCount
+                + " - 可预约 " + availableSeatCount
+                + " = 约 " + occupiedSeatCount + " 人");
+    }
+
+    private void addSelectedSeat() {
+        SeatOption seat = (SeatOption) seatSpinner.getSelectedItem();
+        if (seat == null) {
+            toast("请先刷新并选择座位");
+            return;
+        }
+        if (!seat.canBook) {
+            toast("该座位当前不可预约");
+            return;
+        }
+
+        List<Integer> currentSeats = parseSeatIds(seatsInput.getText().toString());
+        if (!currentSeats.contains(seat.id)) {
+            currentSeats.add(seat.id);
+        }
+        seatsInput.setText(joinSeatIds(currentSeats));
+        appendLog("已添加座位：" + seat);
+    }
+
     private void runCommand(String command) {
         String selectedName = selectedAccountName();
         List<Account> targets = selectedName == null ? enabledAccounts() : namedAccount(selectedName);
@@ -229,18 +473,33 @@ public final class MainActivity extends Activity {
             return;
         }
 
+        String bookingSendTime = null;
+        if ("book".equals(command) && bookingModeSpinner.getSelectedItemPosition() == 1) {
+            bookingSendTime = selectedClockTime();
+        }
+
         setRunning(true);
-        appendLog("开始执行：" + command + "，目标：" + (selectedName == null ? "全部启用账号" : selectedName));
+        if ("book".equals(command) && bookingSendTime != null) {
+            appendLog("开始执行：" + command + "，目标：" + (selectedName == null ? "全部启用账号" : selectedName)
+                    + "，将在 " + bookingSendTime + " 发送预约指令");
+            showWaitingBookingNotification(bookingSendTime);
+        } else {
+            appendLog("开始执行：" + command + "，目标：" + (selectedName == null ? "全部启用账号" : selectedName));
+        }
+        String finalBookingSendTime = bookingSendTime;
         executor.execute(() -> {
             int finalFailures = SeatCommandRunner.run(
                     this,
                     command,
                     selectedName,
-                    "book".equals(command),
+                    finalBookingSendTime,
                     this::appendLogFromWorker
             );
             mainHandler.post(() -> {
                 setRunning(false);
+                if (finalBookingSendTime != null) {
+                    cancelWaitingBookingNotification();
+                }
                 String message = finalFailures == 0 ? "全部操作完成" : "完成，但有 " + finalFailures + " 个账号失败";
                 appendLog(message);
                 toast(message);
@@ -251,11 +510,13 @@ public final class MainActivity extends Activity {
     private void saveAutoBookSettings() {
         String selectedName = selectedAccountName();
         boolean enabled = autoBookInput.isChecked();
-        AutoBookScheduler.setEnabled(this, enabled, selectedName);
+        String bookTime = selectedClockTime();
+        AutoBookScheduler.setEnabled(this, enabled, selectedName, bookTime);
         updateAutoBookStatus();
 
         if (enabled) {
-            appendLog("已开启每日自动预约，目标：" + (selectedName == null ? "全部启用账号" : selectedName));
+            appendLog("已开启每日自动预约，时间：" + bookTime
+                    + "，目标：" + (selectedName == null ? "全部启用账号" : selectedName));
         } else {
             appendLog("已关闭每日自动预约");
         }
@@ -270,6 +531,7 @@ public final class MainActivity extends Activity {
                 accountSpinner.setSelection(index + 1);
             }
         }
+        setClockSpinners(AutoBookScheduler.bookTime(this));
         updateAutoBookStatus();
     }
 
@@ -283,6 +545,8 @@ public final class MainActivity extends Activity {
         String accountName = AutoBookScheduler.accountName(this);
         autoBookStatusView.setText("自动预约：已开启；目标="
                 + (accountName == null ? "全部启用账号" : accountName)
+                + "；时间="
+                + AutoBookScheduler.bookTime(this)
                 + "；下次="
                 + AutoBookScheduler.formatTime(next));
     }
@@ -383,6 +647,33 @@ public final class MainActivity extends Activity {
         enabledInput.setChecked(true);
     }
 
+    private List<Integer> parseSeatIds(String text) {
+        List<Integer> seats = new ArrayList<>();
+        String normalized = text == null ? "" : text.replace('，', ',');
+        for (String part : normalized.split(",")) {
+            String value = part.trim();
+            if (!value.isEmpty()) {
+                try {
+                    seats.add(Integer.parseInt(value));
+                } catch (NumberFormatException ignored) {
+                    // Ignore manually entered fragments that are not numeric seat ids.
+                }
+            }
+        }
+        return seats;
+    }
+
+    private String joinSeatIds(List<Integer> seats) {
+        StringBuilder builder = new StringBuilder();
+        for (Integer seat : seats) {
+            if (builder.length() > 0) {
+                builder.append(", ");
+            }
+            builder.append(seat);
+        }
+        return builder.toString();
+    }
+
     private void setRunning(boolean running) {
         for (Button button : actionButtons) {
             button.setEnabled(!running);
@@ -396,6 +687,44 @@ public final class MainActivity extends Activity {
     private void appendLog(String message) {
         String time = new SimpleDateFormat("HH:mm:ss", Locale.CHINA).format(new Date());
         logView.append("[" + time + "] " + message + "\n");
+    }
+
+    private void clearLogs() {
+        logView.setText("");
+        toast("运行日志已清空");
+    }
+
+    private void showWaitingBookingNotification(String bookingSendTime) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    WAIT_NOTIFICATION_CHANNEL_ID,
+                    "预约等待提示",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            manager.createNotificationChannel(channel);
+        }
+
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(this, WAIT_NOTIFICATION_CHANNEL_ID)
+                : new Notification.Builder(this);
+        Notification notification = builder
+                .setSmallIcon(android.R.drawable.ic_menu_my_calendar)
+                .setContentTitle("等待到达预约时间")
+                .setContentText("将在 " + bookingSendTime + " 发送预约指令")
+                .setOngoing(true)
+                .build();
+        manager.notify(WAIT_NOTIFICATION_ID, notification);
+    }
+
+    private void cancelWaitingBookingNotification() {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        manager.cancel(WAIT_NOTIFICATION_ID);
     }
 
     private void toast(String message) {

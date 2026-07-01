@@ -81,12 +81,17 @@ def get_booking_id(token):
         return None
 
     booking = rows[0]
+    booking_status = str(booking.get("bookingStatus", ""))
+    if booking_status in ("6", "7"):
+        log("当前无预约")
+        return None
+
     booking_id = booking.get("id")
 
     log("当前 bookingid：", booking_id)
     log("座位：", booking.get("seatName"))
     log("开始时间：", booking.get("startDate"))
-    log("状态：", booking.get("bookingStatus"))
+    log("状态：", booking_status)
 
     return booking_id
 

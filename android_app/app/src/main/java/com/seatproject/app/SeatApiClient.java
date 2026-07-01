@@ -12,6 +12,7 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,6 +24,8 @@ final class SeatApiClient {
     private static final String LOGIN_URL = BASE_URL + "/stage-api/login";
     private static final String BOOK_URL = BASE_URL + "/stage-api/api/seatbook/user/addbooking";
     private static final String MY_BOOKING_URL = BASE_URL + "/stage-api/seat/SeatBookingResult/my";
+    private static final String TREE_URL = BASE_URL + "/stage-api/seat/SeatBookingResultAdd/treeselect";
+    private static final String SEAT_QUERY_URL = BASE_URL + "/stage-api/api/seatbook/layout/query";
     private static final String LEAVE_SHORT_URL = BASE_URL + "/spacelink/api/seatbook/user/leave4short";
     private static final String LEAVE_LONG_URL = BASE_URL + "/spacelink/api/seatbook/user/leave4long";
     private static final String SIGNOFF_URL = BASE_URL + "/spacelink/api/seatbook/user/signoff";
@@ -105,6 +108,74 @@ final class SeatApiClient {
         return false;
     }
 
+    List<SeatRegion> seatRegions(String token) throws Exception {
+        JSONObject result = request("GET", TREE_URL, null, null, authHeaders(token));
+        JSONArray data = result.optJSONArray("data");
+        List<SeatRegion> regions = new ArrayList<>();
+        if (data != null) {
+            collectRegions(data, regions);
+        }
+        return regions;
+    }
+
+    SeatRegionSeats seatsByRegionWithStats(String token, int regionId) throws Exception {
+        Calendar now = Calendar.getInstance();
+        Calendar start = Calendar.getInstance();
+        start.add(Calendar.MINUTE, 4);
+        String startTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.CHINA).format(start.getTime());
+        String endTime = new SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(now.getTime()) + " 22:00:00";
+
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("pageNum", "1");
+        params.put("pageSize", "1000");
+        params.put("regionid", String.valueOf(regionId));
+        params.put("starttime", startTime);
+        params.put("endtime", endTime);
+
+        JSONObject result = request("GET", SEAT_QUERY_URL, params, null, authHeaders(token));
+        JSONArray seatList = result.optJSONArray("seatList");
+        if (seatList == null && result.optJSONObject("data") != null) {
+            seatList = result.optJSONObject("data").optJSONArray("seatList");
+        }
+
+        List<SeatOption> seats = new ArrayList<>();
+        if (seatList == null) {
+            return new SeatRegionSeats(seats, 0);
+        }
+
+        int totalSeats = 0;
+        for (int i = 0; i < seatList.length(); i++) {
+            JSONObject seat = seatList.getJSONObject(i);
+            int seatId = seat.optInt("id", 0);
+            String seatName = seat.optString("seatName", "");
+            if (seatId > 0 && !seatName.isEmpty()) {
+                totalSeats += 1;
+            }
+            boolean canBook = seat.optInt("isCan", 0) == 1;
+            if (seatId > 0 && !seatName.isEmpty() && canBook) {
+                seats.add(new SeatOption(seatId, seatName, true));
+            }
+        }
+        return new SeatRegionSeats(seats, totalSeats);
+    }
+
+    List<SeatOption> seatsByRegion(String token, int regionId) throws Exception {
+        SeatRegionSeats result = seatsByRegionWithStats(token, regionId);
+        return result.availableSeats;
+    }
+
+    private void collectRegions(JSONArray nodes, List<SeatRegion> result) throws Exception {
+        for (int i = 0; i < nodes.length(); i++) {
+            JSONObject node = nodes.getJSONObject(i);
+            JSONArray children = node.optJSONArray("children");
+            if (children != null && children.length() > 0) {
+                collectRegions(children, result);
+            } else {
+                result.add(new SeatRegion(node.optInt("id"), node.optString("label")));
+            }
+        }
+    }
+
     JSONObject latestBooking(Account account, String token) throws Exception {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("pageNum", "1");
@@ -118,10 +189,16 @@ final class SeatApiClient {
         }
 
         JSONObject booking = rows.getJSONObject(0);
+        String bookingStatus = booking.optString("bookingStatus", "");
+        if ("6".equals(bookingStatus) || "7".equals(bookingStatus)) {
+            log(account, "当前无预约");
+            return null;
+        }
+
         log(account, "当前预约：id=" + booking.optString("id")
                 + " seat=" + booking.optString("seatName")
                 + " start=" + booking.optString("startDate")
-                + " status=" + booking.optString("bookingStatus"));
+                + " status=" + bookingStatus);
         return booking;
     }
 
@@ -292,5 +369,47 @@ final class SeatApiClient {
 
     private void log(Account account, String message) {
         logSink.log("[" + account.name + "] " + message);
+    }
+}
+
+final class SeatRegion {
+    final int id;
+    final String name;
+
+    SeatRegion(int id, String name) {
+        this.id = id;
+        this.name = name;
+    }
+
+    @Override
+    public String toString() {
+        return name;
+    }
+}
+
+final class SeatOption {
+    final int id;
+    final String name;
+    final boolean canBook;
+
+    SeatOption(int id, String name, boolean canBook) {
+        this.id = id;
+        this.name = name;
+        this.canBook = canBook;
+    }
+
+    @Override
+    public String toString() {
+        return name + " | " + id + " | " + (canBook ? "可预约" : "不可预约");
+    }
+}
+
+final class SeatRegionSeats {
+    final List<SeatOption> availableSeats;
+    final int totalSeats;
+
+    SeatRegionSeats(List<SeatOption> availableSeats, int totalSeats) {
+        this.availableSeats = availableSeats;
+        this.totalSeats = totalSeats;
     }
 }

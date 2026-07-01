@@ -14,6 +14,8 @@ BASE_URL = "https://wslib.haut.edu.cn"
 LOGIN_URL = f"{BASE_URL}/stage-api/login"
 BOOK_URL = f"{BASE_URL}/stage-api/api/seatbook/user/addbooking"
 MY_BOOKING_URL = f"{BASE_URL}/stage-api/seat/SeatBookingResult/my"
+TREE_URL = f"{BASE_URL}/stage-api/seat/SeatBookingResultAdd/treeselect"
+SEAT_QUERY_URL = f"{BASE_URL}/stage-api/api/seatbook/layout/query"
 LEAVE_SHORT_URL = f"{BASE_URL}/spacelink/api/seatbook/user/leave4short"
 LEAVE_LONG_URL = f"{BASE_URL}/spacelink/api/seatbook/user/leave4long"
 SIGNOFF_URL = f"{BASE_URL}/spacelink/api/seatbook/user/signoff"
@@ -29,6 +31,25 @@ class Account:
     password: str
     seats: list[int]
     enabled: bool = True
+
+
+@dataclass
+class SeatRegion:
+    region_id: int
+    name: str
+
+
+@dataclass
+class SeatInfo:
+    seat_id: int
+    name: str
+    is_can: bool
+
+
+@dataclass
+class SeatRegionSeats:
+    available_seats: list[SeatInfo]
+    total_seats: int
 
 
 def log(*message: Any, account: Optional[str] = None, write_file: bool = True) -> None:
@@ -166,6 +187,89 @@ def get_booking_time() -> str:
         time.sleep(0.1)
 
 
+def collect_regions(nodes: list[dict[str, Any]], result: Optional[list[SeatRegion]] = None) -> list[SeatRegion]:
+    if result is None:
+        result = []
+
+    for node in nodes:
+        children = node.get("children")
+        if children:
+            collect_regions(children, result)
+        else:
+            result.append(SeatRegion(region_id=int(node["id"]), name=str(node["label"])))
+
+    return result
+
+
+def get_all_regions(token: str, account_name: str = "crawler") -> list[SeatRegion]:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    result = request_json("GET", TREE_URL, headers=headers, account=account_name)
+    if not result:
+        return []
+
+    return collect_regions(result.get("data", []))
+
+
+def get_seats_by_region_with_stats(token: str, region_id: int, account_name: str = "crawler") -> SeatRegionSeats:
+    now = datetime.now()
+    start_time = (now + timedelta(minutes=4)).strftime("%Y-%m-%d %H:%M:%S")
+    end_time = now.strftime("%Y-%m-%d 22:00:00")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    params = {
+        "pageNum": 1,
+        "pageSize": 1000,
+        "regionid": region_id,
+        "starttime": start_time,
+        "endtime": end_time,
+    }
+
+    result = request_json(
+        "GET",
+        SEAT_QUERY_URL,
+        params=params,
+        headers=headers,
+        account=account_name,
+    )
+    if not result:
+        return []
+
+    if "seatList" in result:
+        raw_seats = result.get("seatList", [])
+    elif isinstance(result.get("data"), dict):
+        raw_seats = result["data"].get("seatList", [])
+    else:
+        raw_seats = []
+
+    seats: list[SeatInfo] = []
+    total_seats = 0
+    for raw_seat in raw_seats:
+        seat_id = raw_seat.get("id")
+        seat_name = raw_seat.get("seatName")
+        if seat_id and seat_name:
+            total_seats += 1
+        is_can = int(raw_seat.get("isCan", 0)) == 1
+        if seat_id and seat_name and is_can:
+            seats.append(
+                SeatInfo(
+                    seat_id=int(seat_id),
+                    name=str(seat_name),
+                    is_can=True,
+                )
+            )
+
+    return SeatRegionSeats(available_seats=seats, total_seats=total_seats)
+
+
+def get_seats_by_region(token: str, region_id: int, account_name: str = "crawler") -> list[SeatInfo]:
+    return get_seats_by_region_with_stats(token, region_id, account_name).available_seats
+
+
 def wait_until_login_window() -> None:
     target_start = datetime.strptime("06:59:30", "%H:%M:%S").time()
     target_end = datetime.strptime("07:00:00", "%H:%M:%S").time()
@@ -175,6 +279,31 @@ def wait_until_login_window() -> None:
         if target_start <= now.time() <= target_end:
             return
         time.sleep(1)
+
+
+def parse_clock_time(value: str) -> datetime.time:
+    text = value.strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+    raise ValueError("时间格式错误，请使用 HH:MM:SS，例如 06:59:30")
+
+
+def wait_until_clock_time(value: str) -> None:
+    target_time = parse_clock_time(value)
+    now = datetime.now()
+    target = datetime.combine(now.date(), target_time)
+    if target <= now:
+        target += timedelta(days=1)
+
+    log(f"等待到 {target.strftime('%Y-%m-%d %H:%M:%S')} 发送预约指令...")
+    while True:
+        remaining = (target - datetime.now()).total_seconds()
+        if remaining <= 0:
+            return
+        time.sleep(min(1, remaining))
 
 
 def should_wait_for_login() -> bool:
@@ -244,12 +373,17 @@ def get_latest_booking(account: Account, token: str) -> Optional[dict[str, Any]]
         return None
 
     booking = rows[0]
+    booking_status = str(booking.get("bookingStatus", ""))
+    if booking_status in ("6", "7"):
+        log("当前无预约", account=account.name)
+        return None
+
     log(
         "当前预约：",
         f"id={booking.get('id')}",
         f"seat={booking.get('seatName')}",
         f"start={booking.get('startDate')}",
-        f"status={booking.get('bookingStatus')}",
+        f"status={booking_status}",
         account=account.name,
     )
     return booking
@@ -307,7 +441,9 @@ def signoff(account: Account, token: str, config: dict[str, Any]) -> bool:
 def run_for_accounts(args: argparse.Namespace, config: dict[str, Any]) -> int:
     accounts = build_accounts(config, args.account)
 
-    if args.command == "book" and should_wait_for_login():
+    if args.command == "book" and args.book_at:
+        wait_until_clock_time(args.book_at)
+    elif args.command == "book" and args.wait_login_window and should_wait_for_login():
         log("当前不在可预约时间，等待到 06:59:30 登录...")
         wait_until_login_window()
 
@@ -356,6 +492,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0,
         help="多个账号之间的间隔秒数，默认 0",
+    )
+    parser.add_argument(
+        "--book-at",
+        help="预约命令指定发送时间，格式 HH:MM:SS；不传则直接发送",
+    )
+    parser.add_argument(
+        "--wait-login-window",
+        action="store_true",
+        help="预约命令沿用旧逻辑：非预约时间等待到 06:59:30",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)

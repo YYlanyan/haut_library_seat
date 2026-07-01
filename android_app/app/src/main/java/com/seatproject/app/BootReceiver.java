@@ -9,6 +9,7 @@ public final class BootReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction()) && AutoBookScheduler.isEnabled(context)) {
             AutoBookScheduler.scheduleNext(context);
+            AutoBookScheduler.startStatusService(context);
         }
     }
 }

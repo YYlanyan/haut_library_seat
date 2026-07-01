@@ -17,20 +17,25 @@ final class AutoBookScheduler {
     private static final String PREFS = "seat_auto_book";
     private static final String KEY_ENABLED = "enabled";
     private static final String KEY_ACCOUNT_NAME = "account_name";
+    private static final String KEY_BOOK_TIME = "book_time";
+    private static final String DEFAULT_BOOK_TIME = "06:59:30";
     private static final int REQUEST_CODE = 65930;
 
     private AutoBookScheduler() {
     }
 
-    static void setEnabled(Context context, boolean enabled, String accountName) {
+    static void setEnabled(Context context, boolean enabled, String accountName, String bookTime) {
         prefs(context).edit()
                 .putBoolean(KEY_ENABLED, enabled)
                 .putString(KEY_ACCOUNT_NAME, accountName == null ? "" : accountName)
+                .putString(KEY_BOOK_TIME, normalizeBookTime(bookTime))
                 .apply();
         if (enabled) {
             scheduleNext(context);
+            startStatusService(context);
         } else {
             cancel(context);
+            stopStatusService(context);
         }
     }
 
@@ -43,12 +48,17 @@ final class AutoBookScheduler {
         return value == null || value.isEmpty() ? null : value;
     }
 
+    static String bookTime(Context context) {
+        String value = prefs(context).getString(KEY_BOOK_TIME, DEFAULT_BOOK_TIME);
+        return normalizeBookTime(value);
+    }
+
     static long scheduleNext(Context context) {
         if (!isEnabled(context)) {
             return 0L;
         }
 
-        long triggerAt = nextTriggerMillis();
+        long triggerAt = nextTriggerMillis(bookTime(context));
         AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         PendingIntent pendingIntent = pendingIntent(context);
         Intent showIntent = new Intent(context, MainActivity.class);
@@ -78,6 +88,19 @@ final class AutoBookScheduler {
         alarmManager.cancel(pendingIntent(context));
     }
 
+    static void startStatusService(Context context) {
+        Intent intent = new Intent(context, AutoBookStatusService.class);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent);
+        } else {
+            context.startService(intent);
+        }
+    }
+
+    static void stopStatusService(Context context) {
+        context.stopService(new Intent(context, AutoBookStatusService.class));
+    }
+
     static String formatTime(long millis) {
         if (millis <= 0L) {
             return "";
@@ -100,15 +123,39 @@ final class AutoBookScheduler {
         );
     }
 
-    private static long nextTriggerMillis() {
+    private static long nextTriggerMillis(String bookTime) {
+        int[] parts = parseClockTime(bookTime);
         Calendar target = Calendar.getInstance();
-        target.set(Calendar.HOUR_OF_DAY, 6);
-        target.set(Calendar.MINUTE, 59);
-        target.set(Calendar.SECOND, 30);
+        target.set(Calendar.HOUR_OF_DAY, parts[0]);
+        target.set(Calendar.MINUTE, parts[1]);
+        target.set(Calendar.SECOND, parts[2]);
         target.set(Calendar.MILLISECOND, 0);
         if (target.getTimeInMillis() <= System.currentTimeMillis()) {
             target.add(Calendar.DAY_OF_MONTH, 1);
         }
         return target.getTimeInMillis();
+    }
+
+    private static String normalizeBookTime(String value) {
+        int[] parts = parseClockTime(value == null || value.trim().isEmpty() ? DEFAULT_BOOK_TIME : value);
+        return String.format(Locale.CHINA, "%02d:%02d:%02d", parts[0], parts[1], parts[2]);
+    }
+
+    private static int[] parseClockTime(String value) {
+        String[] parts = value.trim().split(":");
+        if (parts.length < 2 || parts.length > 3) {
+            return new int[]{6, 59, 30};
+        }
+        try {
+            int hour = Integer.parseInt(parts[0]);
+            int minute = Integer.parseInt(parts[1]);
+            int second = parts.length == 3 ? Integer.parseInt(parts[2]) : 0;
+            if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) {
+                return new int[]{6, 59, 30};
+            }
+            return new int[]{hour, minute, second};
+        } catch (NumberFormatException exception) {
+            return new int[]{6, 59, 30};
+        }
     }
 }
