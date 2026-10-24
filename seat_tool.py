@@ -12,6 +12,7 @@ import requests
 
 BASE_URL = "https://wslib.haut.edu.cn"
 LOGIN_URL = f"{BASE_URL}/stage-api/login"
+CAPTCHA_URL = f"{BASE_URL}/stage-api/captchaImage"
 BOOK_URL = f"{BASE_URL}/stage-api/api/seatbook/user/addbooking"
 MY_BOOKING_URL = f"{BASE_URL}/stage-api/seat/SeatBookingResult/my"
 TREE_URL = f"{BASE_URL}/stage-api/seat/SeatBookingResultAdd/treeselect"
@@ -130,35 +131,226 @@ def request_json(
     timeout: int = 10,
     **kwargs: Any,
 ) -> Optional[dict[str, Any]]:
+
     try:
-        response = requests.request(method, url, timeout=timeout, **kwargs)
-        response.raise_for_status()
+        response = requests.request(
+            method,
+            url,
+            timeout=timeout,
+            **kwargs
+        )
+
+        log(
+            f"服务器响应：status={response.status_code}",
+            account=account
+        )
+
+        # 非 2xx 时，把服务器原始返回打印出来
+        if not response.ok:
+            log(
+                "服务器返回内容：",
+                response.text,
+                account=account
+            )
+
+            log(
+                "响应 Headers：",
+                dict(response.headers),
+                account=account
+            )
+
+            return None
+
         return response.json()
-    except Exception as exc:
-        log("请求失败：", exc, account=account)
+
+    except requests.exceptions.Timeout:
+        log("请求超时", account=account)
         return None
 
+    except requests.exceptions.RequestException as exc:
+        log("请求异常：", exc, account=account)
+        return None
 
-def login(account: Account) -> Optional[str]:
+    except ValueError:
+        log(
+        "服务器返回的不是 JSON：",
+        response.text[:500],
+        account=account
+        )
+        return None
+
+    except Exception as exc:
+        log("未知错误：", exc, account=account)
+        return None
+
+def login(account: Account) -> Optional[tuple[requests.Session, str]]:
     if not account.username or not account.password:
         log("账号或密码为空，请检查配置。", account=account.name)
         return None
 
+    # ========================================================
+    # 创建独立 Session
+    #
+    # captchaImage 和 login 必须使用同一个 Session，
+    # 这样服务器下发的 Cookie 等会话信息才能连续传递。
+    # ========================================================
+
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/149.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en,zh-CN;q=0.9,zh;q=0.8",
+    })
+
+    # ========================================================
+    # 1. 获取验证码 UUID
+    # ========================================================
+
+    try:
+        captcha_response = session.get(
+            CAPTCHA_URL,
+            headers={
+                "Referer": f"{BASE_URL}/login?redirect=%2Findex",
+            },
+            timeout=10,
+        )
+
+        log(
+            f"验证码请求：status={captcha_response.status_code}",
+            account=account.name,
+        )
+
+        if not captcha_response.ok:
+            log(
+                "获取验证码失败：",
+                captcha_response.text[:500],
+                account=account.name,
+            )
+            return None
+
+        captcha_result = captcha_response.json()
+
+    except requests.exceptions.Timeout:
+        log("获取验证码超时", account=account.name)
+        return None
+
+    except requests.exceptions.RequestException as exc:
+        log("获取验证码请求异常：", exc, account=account.name)
+        return None
+
+    except ValueError:
+        log(
+            "验证码接口返回的不是 JSON：",
+            captcha_response.text[:500],
+            account=account.name,
+        )
+        return None
+
+    uuid = captcha_result.get("uuid")
+
+    if not uuid:
+        log(
+            "验证码接口没有返回 uuid：",
+            captcha_result,
+            account=account.name,
+        )
+        return None
+
+    log(
+        "获取验证码 UUID 成功",
+        account=account.name,
+    )
+
+    # ========================================================
+    # 2. 使用 code = "1" 登录(在“single_use”中的几个“try... .py”文件中写了这里固定code的原因)后续Bug修复的话可以再修改此处逻辑
+    #
+    # 注意：
+    # 这里仍然使用上面的 session。
+    # 不要重新 requests.post()。
+    # ========================================================
+
     data = {
         "username": account.username,
         "password": account.password,
+        "code": "1",
+        "uuid": uuid,
     }
-    result = request_json("POST", LOGIN_URL, json=data, account=account.name)
-    if not result:
+
+    try:
+        login_response = session.post(
+            LOGIN_URL,
+            json=data,
+            headers={
+                "Content-Type": "application/json;charset=UTF-8",
+                "Origin": BASE_URL,
+                "Referer": f"{BASE_URL}/login?redirect=%2Findex",
+            },
+            timeout=10,
+        )
+
+        log(
+            f"登录 HTTP 状态码：{login_response.status_code}",
+            account=account.name,
+        )
+
+        if not login_response.ok:
+            log(
+                "登录服务器返回：",
+                login_response.text[:500],
+                account=account.name,
+            )
+
+            log(
+                "登录响应 Headers：",
+                dict(login_response.headers),
+                account=account.name,
+            )
+
+            return None
+
+        result = login_response.json()
+
+    except requests.exceptions.Timeout:
+        log("登录请求超时", account=account.name)
         return None
+
+    except requests.exceptions.RequestException as exc:
+        log("登录请求异常：", exc, account=account.name)
+        return None
+
+    except ValueError:
+        log(
+            "登录接口返回的不是 JSON：",
+            login_response.text[:500],
+            account=account.name,
+        )
+        return None
+
+    # ========================================================
+    # 3. 检查登录结果
+    # ========================================================
 
     token = result.get("token")
+
     if not token:
-        log("登录失败，没有获取到 token：", result, account=account.name)
+        log(
+            "登录失败，没有获取到 token：",
+            result,
+            account=account.name,
+        )
         return None
 
-    log("登录成功", account=account.name)
-    return str(token)
+    log(
+        "登录成功",
+        account=account.name,
+    )
+
+    return session, str(token)
 
 
 def get_booking_time() -> str:
@@ -354,28 +546,87 @@ def reserve(account: Account, token: str, config: dict[str, Any]) -> bool:
     return False
 
 
-def get_latest_booking(account: Account, token: str) -> Optional[dict[str, Any]]:
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"pageNum": 1, "pageSize": 10}
-    result = request_json(
-        "GET",
-        MY_BOOKING_URL,
-        params=params,
-        headers=headers,
-        account=account.name,
-    )
-    if not result:
+def get_latest_booking(
+    account: Account,
+    session: requests.Session,
+    token: str,
+) -> Optional[dict[str, Any]]:
+
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+
+    params = {
+        "pageNum": 1,
+        "pageSize": 10,
+    }
+
+    try:
+        response = session.get(
+            MY_BOOKING_URL,
+            params=params,
+            headers=headers,
+            timeout=10,
+        )
+
+        log(
+            f"服务器响应：status={response.status_code}",
+            account=account.name,
+        )
+
+        if not response.ok:
+            log(
+                "服务器返回内容：",
+                response.text[:500],
+                account=account.name,
+            )
+            return None
+
+        result = response.json()
+
+    except requests.exceptions.Timeout:
+        log(
+            "请求超时",
+            account=account.name,
+        )
+        return None
+
+    except requests.exceptions.RequestException as exc:
+        log(
+            "请求异常：",
+            exc,
+            account=account.name,
+        )
+        return None
+
+    except ValueError:
+        log(
+            "服务器返回的不是 JSON：",
+            response.text[:500],
+            account=account.name,
+        )
         return None
 
     rows = result.get("rows", [])
+
     if not rows:
-        log("没有预约记录", account=account.name)
+        log(
+            "没有预约记录",
+            account=account.name,
+        )
         return None
 
     booking = rows[0]
-    booking_status = str(booking.get("bookingStatus", ""))
+
+    booking_status = str(
+        booking.get("bookingStatus", "")
+    )
+
     if booking_status in ("6", "7"):
-        log("当前无预约", account=account.name)
+        log(
+            "当前无预约",
+            account=account.name,
+        )
         return None
 
     log(
@@ -386,6 +637,7 @@ def get_latest_booking(account: Account, token: str) -> Optional[dict[str, Any]]
         f"status={booking_status}",
         account=account.name,
     )
+
     return booking
 
 
@@ -449,10 +701,13 @@ def run_for_accounts(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
     failures = 0
     for account in accounts:
-        token = login(account)
-        if not token:
+        login_result = login(account)
+
+        if not login_result:
             failures += 1
             continue
+
+        session, token = login_result
 
         if args.command == "book":
             ok = reserve(account, token, config)
@@ -463,7 +718,11 @@ def run_for_accounts(args: argparse.Namespace, config: dict[str, Any]) -> int:
         elif args.command == "signoff":
             ok = signoff(account, token, config)
         elif args.command == "status":
-            ok = get_latest_booking(account, token) is not None
+            ok = get_latest_booking(
+            account,
+            session,
+            token,
+            ) is not None
         else:
             raise ValueError(f"未知命令：{args.command}")
 

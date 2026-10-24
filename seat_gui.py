@@ -98,15 +98,15 @@ class SeatWorker(QObject):
 
             failures = 0
             for account in accounts:
-                token = seat_tool.login(account)
-                if not token:
-                    failures += 1
-                    continue
+                login_result = seat_tool.login(account)
+                if not login_result:
+                    return
+                session, token = login_result
 
                 if self.command == "book":
                     ok = seat_tool.reserve(account, token, config)
                 elif self.command == "status":
-                    ok = seat_tool.get_latest_booking(account, token) is not None
+                    ok = seat_tool.get_latest_booking(account, session, token) is not None
                 elif self.command == "leave-short":
                     ok = seat_tool.leave(account, token, config, "short")
                 elif self.command == "leave-long":

@@ -5,9 +5,12 @@ import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.Build;
+import android.provider.Settings;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
@@ -511,6 +514,11 @@ public final class MainActivity extends Activity {
         String selectedName = selectedAccountName();
         boolean enabled = autoBookInput.isChecked();
         String bookTime = selectedClockTime();
+        if (enabled && !ensureExactAlarmPermission()) {
+            autoBookInput.setChecked(false);
+            return;
+        }
+
         AutoBookScheduler.setEnabled(this, enabled, selectedName, bookTime);
         updateAutoBookStatus();
 
@@ -520,6 +528,23 @@ public final class MainActivity extends Activity {
         } else {
             appendLog("已关闭每日自动预约");
         }
+    }
+
+    private boolean ensureExactAlarmPermission() {
+        if (AutoBookScheduler.canScheduleExactAlarms(this)) {
+            return true;
+        }
+
+        toast("请允许精确闹钟权限，否则息屏后无法按时自动预约");
+        appendLog("缺少精确闹钟权限，已打开系统授权页面。授权后请返回 App 重新开启自动预约。");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Intent intent = new Intent(
+                    Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                    Uri.parse("package:" + getPackageName())
+            );
+            startActivity(intent);
+        }
+        return false;
     }
 
     private void loadAutoBookSettings() {
@@ -541,7 +566,10 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        long next = AutoBookScheduler.scheduleNext(this);
+        long next = AutoBookScheduler.nextTriggerAt(this);
+        if (next <= 0L) {
+            next = AutoBookScheduler.scheduleNext(this);
+        }
         String accountName = AutoBookScheduler.accountName(this);
         autoBookStatusView.setText("自动预约：已开启；目标="
                 + (accountName == null ? "全部启用账号" : accountName)

@@ -27,7 +27,7 @@ public final class AutoBookService extends Service {
                         this,
                         "book",
                         accountName,
-                        AutoBookScheduler.bookTime(this),
+                        null,
                         message -> {
                         }
                 );

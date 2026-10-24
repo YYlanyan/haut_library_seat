@@ -18,6 +18,7 @@ final class AutoBookScheduler {
     private static final String KEY_ENABLED = "enabled";
     private static final String KEY_ACCOUNT_NAME = "account_name";
     private static final String KEY_BOOK_TIME = "book_time";
+    private static final String KEY_NEXT_TRIGGER_AT = "next_trigger_at";
     private static final String DEFAULT_BOOK_TIME = "06:59:30";
     private static final int REQUEST_CODE = 65930;
 
@@ -61,31 +62,39 @@ final class AutoBookScheduler {
         long triggerAt = nextTriggerMillis(bookTime(context));
         AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         PendingIntent pendingIntent = pendingIntent(context);
-        Intent showIntent = new Intent(context, MainActivity.class);
-        PendingIntent showPendingIntent = PendingIntent.getActivity(
-                context,
-                REQUEST_CODE,
-                showIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (alarmManager.canScheduleExactAlarms()) {
                 alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
             } else {
-                alarmManager.setAlarmClock(new AlarmManager.AlarmClockInfo(triggerAt, showPendingIntent), pendingIntent);
+                prefs(context).edit().putLong(KEY_NEXT_TRIGGER_AT, 0L).apply();
+                return 0L;
             }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
         } else {
             alarmManager.setExact(AlarmManager.RTC_WAKEUP, triggerAt, pendingIntent);
         }
+        prefs(context).edit().putLong(KEY_NEXT_TRIGGER_AT, triggerAt).apply();
         return triggerAt;
     }
 
     static void cancel(Context context) {
         AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         alarmManager.cancel(pendingIntent(context));
+        prefs(context).edit().putLong(KEY_NEXT_TRIGGER_AT, 0L).apply();
+    }
+
+    static boolean canScheduleExactAlarms(Context context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return true;
+        }
+        AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        return alarmManager.canScheduleExactAlarms();
+    }
+
+    static long nextTriggerAt(Context context) {
+        return prefs(context).getLong(KEY_NEXT_TRIGGER_AT, 0L);
     }
 
     static void startStatusService(Context context) {

@@ -41,7 +41,7 @@ public final class AutoBookStatusService extends Service {
         }
 
         String accountName = AutoBookScheduler.accountName(this);
-        long next = AutoBookScheduler.scheduleNext(this);
+        long next = AutoBookScheduler.nextTriggerAt(this);
         String text = "目标：" + (accountName == null ? "全部启用账号" : accountName)
                 + "；时间：" + AutoBookScheduler.bookTime(this)
                 + "；下次：" + AutoBookScheduler.formatTime(next);
